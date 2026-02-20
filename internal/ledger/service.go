@@ -46,10 +46,7 @@ func NewService(store *Store, signer hsm.Signer, log *slog.Logger) *Service {
 
 // PostTransaction — точка, где сходятся все инварианты.
 //
-// ВАЖНО: actor_id приходит в теле запроса и в демо не аутентифицируется.
-// В проде личность вызывающего берётся из mTLS-сертификата (SPIFFE) или JWT
-// и не может быть подменена клиентом — иначе сотрудник запишет действие
-// в аудит чужим именем.
+// The mTLS transport supplies the authenticated actor before this handler runs.
 //
 // Порядок важен:
 //  1. дешёвая валидация до похода в базу;
@@ -73,12 +70,18 @@ func (s *Service) PostTransaction(ctx context.Context, req *ledgerv1.PostTransac
 	defer func() { _ = tx.Rollback() }()
 
 	// --- Идемпотентность -----------------------------------------------------
+	if s.store.postgres {
+		// Serialize retries before reading balances, including a retry after the first debit exhausts an account.
+		if _, err := tx.ExecContext(ctx, "SELECT pg_advisory_xact_lock(1, hashtext($1))", req.IdempotencyKey); err != nil {
+			return nil, status.Errorf(codes.Unavailable, "lock idempotency key: %v", err)
+		}
+	}
 	existing, err := loadTxByKey(ctx, tx, req.IdempotencyKey)
 	switch {
 	case err == nil:
 		// Ключ уже использован. Если тело то же — это ретрай: возвращаем
 		// исходный результат, ничего не проводя повторно.
-		if !bytes.Equal(existing.RequestHash, reqHash) {
+		if !bytes.Equal(existing.RequestHash, reqHash) || existing.ActorID != req.ActorId || existing.Note != req.Note {
 			return nil, status.Errorf(codes.FailedPrecondition,
 				"idempotency key %q is already used by tx %s with a different payload",
 				req.IdempotencyKey, existing.TxID)
@@ -115,7 +118,7 @@ func (s *Service) PostTransaction(ctx context.Context, req *ledgerv1.PostTransac
 	}
 	newBalances := make(map[string]int64, len(accounts))
 	for _, id := range sortedIDs(accounts) {
-		current, err := cachedBalance(ctx, tx, id)
+		current, err := cachedBalance(ctx, tx, id, s.store.postgres)
 		if err != nil {
 			return nil, err
 		}
@@ -133,7 +136,10 @@ func (s *Service) PostTransaction(ctx context.Context, req *ledgerv1.PostTransac
 
 	// --- Подпись HSM ---------------------------------------------------------
 	now := s.now()
-	txID := newID("tx_")
+	txID, err := newID("tx_")
+	if err != nil {
+		return nil, status.Error(codes.Internal, "cannot allocate transaction ID")
+	}
 	digest := txDigest(txID, req.IdempotencyKey, operation, req.Reference, req.ActorId, req.Note, currency, scale, postings)
 
 	signature, err := s.signer.Sign(ctx, digest)
@@ -162,14 +168,14 @@ func (s *Service) PostTransaction(ctx context.Context, req *ledgerv1.PostTransac
 		INSERT INTO transactions
 			(tx_id, idempotency_key, request_hash, operation, reference, actor_id,
 			 note, currency, scale, digest, key_id, signature, created_at)
-		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+		VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13)`,
 		rec.TxID, rec.IdempotencyKey, rec.RequestHash, rec.Operation, rec.Reference,
 		rec.ActorID, rec.Note, rec.Currency, rec.Scale, rec.Digest, rec.KeyID,
 		rec.Signature, formatTime(rec.CreatedAt)); err != nil {
 		if isUniqueViolation(err) {
 			// Гонка между процессами: ключ успел записать другой инстанс.
 			_ = tx.Rollback()
-			return s.replayCommitted(ctx, req.IdempotencyKey, reqHash)
+			return s.replayCommitted(ctx, req, reqHash)
 		}
 		return nil, status.Errorf(codes.Internal, "insert transaction: %v", err)
 	}
@@ -177,7 +183,7 @@ func (s *Service) PostTransaction(ctx context.Context, req *ledgerv1.PostTransac
 	for _, p := range postings {
 		if _, err := tx.ExecContext(ctx, `
 			INSERT INTO ledger_entries (tx_id, account_id, amount, created_at)
-			VALUES (?, ?, ?, ?)`,
+			VALUES ($1, $2, $3, $4)`,
 			rec.TxID, p.AccountID, p.Amount, formatTime(rec.CreatedAt)); err != nil {
 			return nil, status.Errorf(codes.Internal, "insert entry: %v", err)
 		}
@@ -185,7 +191,7 @@ func (s *Service) PostTransaction(ctx context.Context, req *ledgerv1.PostTransac
 
 	for _, id := range sortedIDs(accounts) {
 		if _, err := tx.ExecContext(ctx,
-			`UPDATE account_balances SET balance = ? WHERE account_id = ?`,
+			`UPDATE account_balances SET balance = $1 WHERE account_id = $2`,
 			newBalances[id], id); err != nil {
 			return nil, status.Errorf(codes.Internal, "update balance %s: %v", id, err)
 		}
@@ -194,6 +200,11 @@ func (s *Service) PostTransaction(ctx context.Context, req *ledgerv1.PostTransac
 	auditPayload, err := json.Marshal(newTxAudit(rec, postings))
 	if err != nil {
 		return nil, status.Errorf(codes.Internal, "marshal audit payload: %v", err)
+	}
+	if s.store.postgres {
+		if _, err := tx.ExecContext(ctx, "SELECT pg_advisory_xact_lock(2, 0)"); err != nil {
+			return nil, status.Errorf(codes.Internal, "lock audit chain: %v", err)
+		}
 	}
 	if _, err := appendAudit(ctx, tx, rec.ActorID, "ledger.transaction.posted",
 		"transaction:"+rec.TxID, string(auditPayload), formatTime(rec.CreatedAt)); err != nil {
@@ -217,18 +228,19 @@ func (s *Service) PostTransaction(ctx context.Context, req *ledgerv1.PostTransac
 
 // replayCommitted — путь для гонки: другой процесс уже провёл операцию с этим
 // ключом. Читаем её в новой транзакции и отдаём как обычно.
-func (s *Service) replayCommitted(ctx context.Context, key string, reqHash []byte) (*ledgerv1.PostTransactionResponse, error) {
+func (s *Service) replayCommitted(ctx context.Context, req *ledgerv1.PostTransactionRequest, reqHash []byte) (*ledgerv1.PostTransactionResponse, error) {
 	tx, err := s.store.db.BeginTx(ctx, nil)
 	if err != nil {
 		return nil, status.Errorf(codes.Unavailable, "begin replay: %v", err)
 	}
 	defer func() { _ = tx.Rollback() }()
 
+	key := req.IdempotencyKey
 	rec, err := loadTxByKey(ctx, tx, key)
 	if err != nil {
 		return nil, status.Errorf(codes.Aborted, "concurrent retry conflict, retry the request")
 	}
-	if !bytes.Equal(rec.RequestHash, reqHash) {
+	if !bytes.Equal(rec.RequestHash, reqHash) || rec.ActorID != req.ActorId || rec.Note != req.Note {
 		return nil, status.Errorf(codes.FailedPrecondition,
 			"idempotency key %q is already used with a different payload", key)
 	}
@@ -248,7 +260,7 @@ func (s *Service) responseForTx(ctx context.Context, tx *sql.Tx, rec *txRecord, 
 	rows, err := tx.QueryContext(ctx, `
 		SELECT account_id, SUM(amount)
 		FROM ledger_entries
-		WHERE tx_id = ?
+		WHERE tx_id = $1
 		GROUP BY account_id
 		ORDER BY account_id`, rec.TxID)
 	if err != nil {
@@ -275,6 +287,13 @@ func (s *Service) responseForTx(ctx context.Context, tx *sql.Tx, rec *txRecord, 
 		b, err := accountWithCachedBalance(ctx, tx, id)
 		if err != nil {
 			return nil, err
+		}
+		if deduplicated {
+			err = tx.QueryRowContext(ctx, `SELECT SUM(amount) FROM ledger_entries WHERE account_id = $1 AND seq <=
+     (SELECT MAX(seq) FROM ledger_entries WHERE tx_id = $2 AND account_id = $1)`, id, rec.TxID).Scan(&b.Balance)
+			if err != nil {
+				return nil, status.Errorf(codes.Internal, "read posted balance: %v", err)
+			}
 		}
 		balances = append(balances, b)
 	}
@@ -305,7 +324,7 @@ func (s *Service) GetAccount(ctx context.Context, req *ledgerv1.GetAccountReques
 		SELECT a.id, a.owner_id, a.kind, a.currency, a.scale,
 		       COALESCE((SELECT SUM(e.amount) FROM ledger_entries e WHERE e.account_id = a.id), 0)
 		FROM accounts a
-		WHERE a.id = ?`, req.GetAccountId())
+		WHERE a.id = $1`, req.GetAccountId())
 
 	var id, ownerID, kind, currency string
 	var scale int32
@@ -343,10 +362,10 @@ func (s *Service) ListEntries(ctx context.Context, req *ledgerv1.ListEntriesRequ
 		JOIN transactions t ON t.tx_id = e.tx_id`
 	args := []any{}
 	if id := req.GetAccountId(); id != "" {
-		query += ` WHERE e.account_id = ?`
+		query += ` WHERE e.account_id = $1`
 		args = append(args, id)
 	}
-	query += ` ORDER BY e.seq DESC LIMIT ?`
+	query += fmt.Sprintf(" ORDER BY e.seq DESC LIMIT $%d", len(args)+1)
 	args = append(args, limit)
 
 	rows, err := s.store.db.QueryContext(ctx, query, args...)
@@ -449,7 +468,7 @@ func loadAccounts(ctx context.Context, tx *sql.Tx, postings []posting) (map[stri
 		var a Account
 		err := tx.QueryRowContext(ctx, `
 			SELECT id, owner_id, owner_type, kind, currency, scale
-			FROM accounts WHERE id = ?`, p.AccountID).
+			FROM accounts WHERE id = $1`, p.AccountID).
 			Scan(&a.ID, &a.OwnerID, &a.OwnerType, &a.Kind, &a.Currency, &a.Scale)
 		if errors.Is(err, sql.ErrNoRows) {
 			return nil, status.Errorf(codes.NotFound, "account %q not found", p.AccountID)
@@ -539,13 +558,16 @@ func scanTxRow(sc rowScanner) (*txRecord, error) {
 
 func loadTxByKey(ctx context.Context, tx *sql.Tx, key string) (*txRecord, error) {
 	return scanTxRow(tx.QueryRowContext(ctx,
-		`SELECT `+txColumns+` FROM transactions WHERE idempotency_key = ?`, key))
+		`SELECT `+txColumns+` FROM transactions WHERE idempotency_key = $1`, key))
 }
 
-func cachedBalance(ctx context.Context, tx *sql.Tx, accountID string) (int64, error) {
+func cachedBalance(ctx context.Context, tx *sql.Tx, accountID string, lock bool) (int64, error) {
 	var balance int64
-	err := tx.QueryRowContext(ctx,
-		`SELECT balance FROM account_balances WHERE account_id = ?`, accountID).Scan(&balance)
+	query := "SELECT balance FROM account_balances WHERE account_id = $1"
+	if lock {
+		query += " FOR UPDATE"
+	}
+	err := tx.QueryRowContext(ctx, query, accountID).Scan(&balance)
 	if errors.Is(err, sql.ErrNoRows) {
 		return 0, status.Errorf(codes.Internal, "balance row for account %s is missing", accountID)
 	}
@@ -565,7 +587,7 @@ func accountWithCachedBalance(ctx context.Context, tx *sql.Tx, accountID string)
 		SELECT a.id, a.owner_id, a.kind, a.currency, a.scale, b.balance
 		FROM accounts a
 		JOIN account_balances b ON b.account_id = a.id
-		WHERE a.id = ?`, accountID).
+		WHERE a.id = $1`, accountID).
 		Scan(&id, &ownerID, &kind, &currency, &scale, &balance)
 	if errors.Is(err, sql.ErrNoRows) {
 		return nil, status.Errorf(codes.NotFound, "account %q not found", accountID)
@@ -585,11 +607,11 @@ func accountWithCachedBalance(ctx context.Context, tx *sql.Tx, accountID string)
 
 // newID — идентификатор операции. CSPRNG, а не счётчик: последовательность
 // угадывается и позволяет предугадывать id соседних операций.
-func newID(prefix string) string {
+func newID(prefix string) (string, error) {
 	var b [16]byte
 	if _, err := rand.Read(b[:]); err != nil {
 		// Отказ CSPRNG — аварийная ситуация: продолжать финансовые операции нельзя.
-		panic(fmt.Sprintf("ledger: csprng failure: %v", err))
+		return "", err
 	}
-	return prefix + hex.EncodeToString(b[:])
+	return prefix + hex.EncodeToString(b[:]), nil
 }

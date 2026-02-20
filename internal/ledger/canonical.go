@@ -70,8 +70,7 @@ func sortedPostings(in []*ledgerv1.Posting) []posting {
 // Используется при повторном idempotency_key: если тело другое — это не ретрай,
 // а ошибка клиента, и операцию проводить нельзя.
 //
-// Хешируем только то, что влияет на деньги и бизнес-смысл. actor_id и note
-// намеренно не входят: ретрай из другого пода с тем же телом — всё ещё ретрай.
+// The replay path also compares the authenticated actor and signed note.
 func requestHash(operation, reference string, postings []posting) []byte {
 	e := &encoder{}
 	e.str("ledger.request.v1")

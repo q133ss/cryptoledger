@@ -3,7 +3,9 @@ package ledger
 import (
 	"bytes"
 	"context"
+	"database/sql"
 	"fmt"
+	"strings"
 
 	ledgerv1 "cryptoledger/gen/ledger/v1"
 	"cryptoledger/internal/hsm"
@@ -24,6 +26,15 @@ import (
 // Каждая находка помечена тегом [audit], [signature], [double-entry], [balance],
 // чтобы алерт сразу показывал, какой слой сломался.
 func (s *Service) VerifyIntegrity(ctx context.Context, _ *ledgerv1.VerifyIntegrityRequest) (*ledgerv1.VerifyIntegrityResponse, error) {
+	opts := &sql.TxOptions{ReadOnly: true}
+	if s.store.postgres {
+		opts.Isolation = sql.LevelRepeatableRead
+	}
+	tx, err := s.store.db.BeginTx(ctx, opts)
+	if err != nil {
+		return nil, status.Errorf(codes.Unavailable, "begin verification: %v", err)
+	}
+	defer tx.Rollback()
 	resp := &ledgerv1.VerifyIntegrityResponse{}
 	var problems []string
 
@@ -45,7 +56,7 @@ func (s *Service) VerifyIntegrity(ctx context.Context, _ *ledgerv1.VerifyIntegri
 		RowHash   []byte
 	}
 
-	rows, err := s.store.db.QueryContext(ctx, `
+	rows, err := tx.QueryContext(ctx, `
 		SELECT seq, actor_id, action, target, payload, created_at, prev_hash, row_hash
 		FROM audit_log ORDER BY seq`)
 	if err != nil {
@@ -68,9 +79,13 @@ func (s *Service) VerifyIntegrity(ctx context.Context, _ *ledgerv1.VerifyIntegri
 	rows.Close()
 
 	// Генезис цепочки — 32 нулевых байта.
+	audited := make(map[string]int)
 	prev := make([]byte, 32)
 	for _, r := range auditRows {
 		resp.AuditRecordsChecked++
+		if r.Action == "ledger.transaction.posted" {
+			audited[strings.TrimPrefix(r.Target, "transaction:")]++
+		}
 
 		if !bytes.Equal(r.PrevHash, prev) {
 			add("[audit] seq %d: prev_hash не совпадает с хешем предыдущей записи — строку удалили или вставили", r.Seq)
@@ -98,7 +113,7 @@ func (s *Service) VerifyIntegrity(ctx context.Context, _ *ledgerv1.VerifyIntegri
 		Signature      []byte
 	}
 
-	rows, err = s.store.db.QueryContext(ctx, `
+	rows, err = tx.QueryContext(ctx, `
 		SELECT tx_id, idempotency_key, operation, reference, actor_id, note,
 		       currency, scale, digest, key_id, signature
 		FROM transactions ORDER BY created_at, tx_id`)
@@ -126,10 +141,14 @@ func (s *Service) VerifyIntegrity(ctx context.Context, _ *ledgerv1.VerifyIntegri
 	publicKey := s.signer.PublicKey()
 	for _, t := range txs {
 		resp.TransactionsChecked++
+		if audited[t.TxID] != 1 {
+			add("[audit] tx %s: expected one posting event, found %d", t.TxID, audited[t.TxID])
+		}
+		delete(audited, t.TxID)
 
-		entryRows, err := s.store.db.QueryContext(ctx, `
+		entryRows, err := tx.QueryContext(ctx, `
 			SELECT account_id, amount FROM ledger_entries
-			WHERE tx_id = ? ORDER BY account_id, seq`, t.TxID)
+			WHERE tx_id = $1 ORDER BY account_id, seq`, t.TxID)
 		if err != nil {
 			return nil, status.Errorf(codes.Internal, "read entries of %s: %v", t.TxID, err)
 		}
@@ -180,7 +199,7 @@ func (s *Service) VerifyIntegrity(ctx context.Context, _ *ledgerv1.VerifyIntegri
 	}
 
 	// --- 3. Кэш балансов против журнала --------------------------------------
-	rows, err = s.store.db.QueryContext(ctx, `
+	rows, err = tx.QueryContext(ctx, `
 		SELECT a.id,
 		       COALESCE(b.balance, 0),
 		       COALESCE((SELECT SUM(e.amount) FROM ledger_entries e WHERE e.account_id = a.id), 0)
@@ -216,6 +235,9 @@ func (s *Service) VerifyIntegrity(ctx context.Context, _ *ledgerv1.VerifyIntegri
 		}
 	}
 
+	for id := range audited {
+		add("[audit] posting event references missing transaction %s", id)
+	}
 	resp.Problems = problems
 	resp.Ok = len(problems) == 0
 	return resp, nil

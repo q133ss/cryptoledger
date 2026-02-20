@@ -21,7 +21,9 @@ var schemaSQL string
 // (см. deploy/postgres/schema.sql). Здесь SQLite, чтобы демо запускалось без
 // docker-compose; SQL и инварианты те же самые.
 type Store struct {
-	db *sql.DB
+	db        *sql.DB
+	postgres  bool
+	closePool func()
 }
 
 // Open открывает базу по пути и применяет схему (идемпотентно).
@@ -55,7 +57,13 @@ func Open(path string) (*Store, error) {
 	return &Store{db: db}, nil
 }
 
-func (s *Store) Close() error { return s.db.Close() }
+func (s *Store) Close() error {
+	err := s.db.Close()
+	if s.closePool != nil {
+		s.closePool()
+	}
+	return err
+}
 
 // DB отдаёт низкоуровневый доступ. Нужен тестам и демо, чтобы сыграть роль
 // DBA с прямым доступом к базе (в проде таких прав у сервиса нет).
@@ -93,13 +101,13 @@ func (s *Store) CreateAccount(ctx context.Context, a Account) error {
 	now := formatTime(time.Now())
 	if _, err := tx.ExecContext(ctx, `
 		INSERT INTO accounts (id, owner_id, owner_type, kind, currency, scale, created_at)
-		VALUES (?, ?, ?, ?, ?, ?, ?)
+		VALUES ($1, $2, $3, $4, $5, $6, $7)
 		ON CONFLICT(id) DO NOTHING`,
 		a.ID, a.OwnerID, a.OwnerType, a.Kind, a.Currency, a.Scale, now); err != nil {
 		return fmt.Errorf("store: insert account: %w", err)
 	}
 	if _, err := tx.ExecContext(ctx, `
-		INSERT INTO account_balances (account_id, balance) VALUES (?, 0)
+		INSERT INTO account_balances (account_id, balance) VALUES ($1, 0)
 		ON CONFLICT(account_id) DO NOTHING`, a.ID); err != nil {
 		return fmt.Errorf("store: insert balance: %w", err)
 	}

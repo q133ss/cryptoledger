@@ -23,7 +23,7 @@ func appendAudit(ctx context.Context, tx *sql.Tx, actorID, action, target, paylo
 	rowHash := auditRowHash(prev, actorID, action, target, payload, createdAt)
 	if _, err := tx.ExecContext(ctx, `
 		INSERT INTO audit_log (actor_id, action, target, payload, created_at, prev_hash, row_hash)
-		VALUES (?, ?, ?, ?, ?, ?, ?)`,
+		VALUES ($1, $2, $3, $4, $5, $6, $7)`,
 		actorID, action, target, payload, createdAt, prev, rowHash); err != nil {
 		return nil, fmt.Errorf("audit: append: %w", err)
 	}
