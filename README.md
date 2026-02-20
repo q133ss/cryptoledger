@@ -1,307 +1,63 @@
-# cryptoledger — показательная реализация финансового ядра
+# cryptoledger
 
-Учебный, но рабочий пример того, что написано в резюме:
+[![CI](https://github.com/q133ss/cryptoledger/actions/workflows/ci.yml/badge.svg)](https://github.com/q133ss/cryptoledger/actions/workflows/ci.yml) · [Русский](README.ru.md) · [MIT](LICENSE)
 
-> Для списаний и зачислений использовал gRPC API сервиса проводок Ledger
-> с сообщениями Protobuf. Реализовал двойную запись и обработку транзакций
-> по ключу идемпотентности... Запретил изменение и удаление проводок на уровне
-> БД (append-only), а записи журнала аудита связал в цепочку хешей...
-> Подпись транзакций изолировал в HSM.
+A double-entry ledger in Go for retrying a transfer after losing the server's reply. The client supplies an idempotency key. PostgreSQL commits both postings, the balance updates, the Ed25519 signature and the audit event together. A retry returns the original transaction and its balances at commit time.
 
-Это не псевдокод и не набор функций «для вида»: демо поднимает gRPC-сервер
-поверх mTLS, ходит в него настоящим клиентом и пишет в настоящую базу.
-Попутно оно пытается подделать историю — и показывает, как это ловится.
+## Try a lost reply
 
-## Быстрый старт
+With Docker Compose v2, run these commands from the repository root. The first build downloads Go modules and images.
 
-```powershell
-cd cryptoledger
-
-# Полный сценарий: депозит, ретрай, ошибки, резерв, подмена истории
-go run ./cmd/demo
-
-# Тесты: идемпотентность, конкурентные ретраи, триггеры, детект подмены
-go test ./...
-
-# Отдельный сервер для экспериментов (grpcurl, свой клиент)
-go run ./cmd/ledgerserver -seed
-# в другом окне:
-grpcurl -plaintext localhost:50051 list
-grpcurl -plaintext localhost:50051 ledger.v1.LedgerService/GetAccount -d '{"account_id":"acc_player_1_main"}'
+```sh
+docker compose up -d --build --wait
+docker compose exec ledger ledgerctl demo
 ```
 
-Если в старом PowerShell вместо русского текста «кракозябры»:
+On a fresh database the demo transfers **1 USDT**, discards the first reply and sends the request again over mutually authenticated TLS. Look for `deduplicated=true`, one transaction, two entries and one audit event. Rerunning the command uses the same key. Restarting the server preserves its demo signing seed and the journal.
 
-```powershell
-chcp 65001
+![Recorded terminal output of the PostgreSQL retry demo](docs/assets/retry.gif)
+
+[Terminal recording in asciicast format](docs/assets/retry.cast)
+
+```sh
+docker compose exec ledger ledgerctl account get acc_player_1_main
+docker compose exec ledger ledgerctl audit tail -n 3
+docker compose exec ledger ledgerctl verify
+docker compose down
 ```
 
-## Карта проекта
+With Go 1.26, `go run ./cmd/demo` runs a self-contained SQLite walkthrough. It creates temporary accounts, certificates and a signing key. Compose stores its database and identity in named volumes.
 
-```
-proto/ledger/v1/ledger.proto     контракт: сервис, сообщения, инварианты в комментариях
-gen/ledger/v1/                   сгенерированный protoc код (закоммичен, protoc не обязателен)
-cmd/demo/                        сценарий «как это работает» + попытка подмены
-cmd/ledgerserver/                отдельный процесс финансового ядра (gRPC, mTLS, reflection)
-internal/ledger/
-  schema.sql                     таблицы, append-only триггеры, запрет минуса
-  store.go                       открытие БД, счета, время, уникальность ключа
-  service.go                     PostTransaction / GetAccount / ListEntries
-  verify.go                      сверка журнала, подписей, кэша балансов и аудита
-  canonical.go                   каноническое представление для хешей и подписи
-  audit.go                       добавление записи в хеш-цепочку
-  money.go                       int64 + scale, проверка переполнения
-  mapping.go                     enum proto ↔ строковые коды в БД
-internal/hsm/                    интерфейс Signer + SoftHSM (заглушка реального модуля)
-internal/mtls/                   dev-сертификаты и настройка mutual TLS
-deploy/postgres/schema.sql       прод-вариант: numeric(38,18), гранты, deferred-проверка
-scripts/gen.ps1                  перегенерация proto
-```
+## Guarantees you can check
 
-## Соглашение о деньгах
+| Observation | Mechanism | Evidence |
+|---|---|---|
+| Ten competing clients record one transfer | Transaction-scoped key lock, unique idempotency key and payload comparison | [PostgreSQL concurrency test](internal/ledger/postgres_test.go) |
+| Every transaction balances in one currency and scale | Validated postings and deferred PostgreSQL sum check at commit | [Schema](deploy/postgres/schema.sql) |
+| A player's balance stays nonnegative | Account balance locks acquired in sorted order and a database trigger | [Posting path](internal/ledger/service.go) |
+| Each cached balance equals that account's journal sum | Reconciliation in one read snapshot | [Property test](internal/ledger/property_test.go) |
+| History is append-only for the runtime role | Grants, mutation triggers, linked audit hashes and signed transaction digests | [Verifier](internal/ledger/verify.go) |
+| Audit records identify the calling client | The server derives the actor from a verified mTLS certificate | [Identity interceptor](internal/mtls/identity.go) |
 
-- Баланса-как-поля нет. `balance` — это `SUM(amount)` по счёту.
-- `amount` — знаковое **изменение баланса счёта**: плюс зачисление, минус списание.
-  Сумма всех проводок одной операции обязана быть `0`.
-- Деньги — `int64` в минимальных единицах + явный `scale` счёта
-  (`scale = 6`, `1 USDT = 1_000_000`). Никаких `float64`.
-  В проде на Postgres это `numeric(38,18)` — см. `deploy/postgres/schema.sql`.
-- Счета игрока (`player_main`, `player_locked`, `player_bonus`) не могут уйти
-  в минус. Счёт компании (`house_equity`) может быть отрицательным: это нормальная
-  бухгалтерская картина, а не долг.
+## Architecture
 
-## Шесть механизмов
-
-### 1. gRPC + Protobuf + mTLS
-
-Контракт лежит в `proto/ledger/v1/ledger.proto`. Клиент не может «попросить
-перевести деньги» текстом: у операции есть строгая схема, а неизвестные поля
-не превращаются молча в мусор.
-
-В демо сервер и клиент общаются по TLS 1.3, причём сервер требует клиентский
-сертификат (`RequireAndVerifyClientCert`). Без `client.crt` соединение не
-установится. В проде это заменяется на cert-manager + внутренний CA, код
-сервиса не меняется.
-
-Смотреть: `cmd/demo/main.go` (старт транспорта), `internal/mtls/mtls.go`.
-
-### 2. Двойная запись
-
-`PostTransaction` принимает минимум две проводки и проверяет, что их сумма
-ноль **до** открытия транзакции БД. Затем в одной транзакции БД:
-
-1. проверяются счета и валюта;
-2. читается текущий баланс и считается новый;
-3. проверяется, что счёт игрока не уходит в минус;
-4. вставляются проводки;
-5. обновляется кэш `account_balances`;
-6. добавляется запись аудита;
-7. ставится подпись HSM;
-8. `COMMIT`.
-
-Любой сбой на шаге 1–7 откатывает всё: либо деньги и запись о них появились
-вместе, либо не появилось ничего.
-
-Смотреть: `internal/ledger/service.go`, функция `PostTransaction`.
-
-### 3. Идемпотентность
-
-У каждой операции есть `idempotency_key`, на который в БД стоит `UNIQUE`.
-Логика:
-
-- ключ не встречался → операция проводится;
-- ключ встречался, `request_hash` совпал → это ретрай: возвращается **исходная**
-  операция (тот же `tx_id`, та же подпись, те же балансы), `deduplicated = true`,
-  новых проводок нет;
-- ключ встречался, тело другое → `FailedPrecondition`: клиент переиспользовал
-  ключ, и проводить вторую операцию нельзя.
-
-`request_hash` считается по operation, reference и отсортированным проводкам.
-Порядок проводок в запросе не важен. `actor_id` и `note` в хеш не входят:
-ретрай из другого пода с тем же денежным смыслом — всё ещё ретрай.
-
-Гонка двух одновременных запросов решается уникальным индексом: проигравший
-получает `UNIQUE constraint failed` и перечитывает уже проведённую операцию
-(`replayCommitted`). В тестах это проверяет `TestConcurrentRetriesCreateOneTransaction`.
-
-Смотреть: `internal/ledger/service.go` (начало `PostTransaction`),
-`internal/ledger/canonical.go` (`requestHash`).
-
-### 4. Append-only на уровне БД
-
-Приложение не содержит `UPDATE`/`DELETE` для журнала — но это только соглашение.
-Настоящая защита в `internal/ledger/schema.sql`:
-
-```sql
-CREATE TRIGGER ledger_entries_no_update
-BEFORE UPDATE ON ledger_entries
-BEGIN
-    SELECT RAISE(ABORT, 'ledger_entries is append-only: UPDATE is forbidden');
-END;
+```mermaid
+flowchart LR
+  C[ledgerctl] -->|gRPC over mTLS| S[Ledger service]
+  S -->|canonical digest| K[Local Ed25519 signer]
+  K -->|signature| S
+  S -->|single commit| D[(PostgreSQL or SQLite)]
+  V[Integrity verifier] -->|snapshot| D
 ```
 
-Плюс такие же триггеры на `transactions` и `audit_log`.
-В Postgres-варианте дополнительно `REVOKE UPDATE, DELETE` у роли сервиса.
+This reference implementation covers the Ledger component of the [platform diagram](docs/assets/platform-context.png). It uses a software signing key and one audit chain. The surrounding wallet, payout service, key custody and blockchain integrations belong to the platform context. [Architecture and design decisions](docs/architecture.md) · [Threat model](docs/threat-model.md)
 
-Демо пробует `UPDATE` и `DELETE` напрямую и печатает ошибку БД.
-Важно понимать: тот, у кого есть права владельца таблицы, может сделать
-`DROP TRIGGER`. Именно от такого сценария защищают следующие два механизма.
+## Operations and performance
 
-### 5. Хеш-цепочка аудита
+The gRPC interface exposes posting, account lookup, entry history and verification. `ledgerctl account create` and `audit tail` are local operator commands using database access. In Compose the HTTP listener is bound to localhost on port 8081 and serves `/healthz`, `/readyz` and `/metrics`. The gRPC listener is bound to localhost on port 50051. Set LEDGER_PORT and LEDGER_HTTP_PORT to change the host ports.
 
-Каждая запись `audit_log` хранит `prev_hash` и `row_hash`:
+[Measured throughput and latency](docs/benchmarks.md) · [API contract](proto/ledger/v1/ledger.proto) · [Contributing and integration tests](CONTRIBUTING.md) · [Open work](https://github.com/q133ss/cryptoledger/issues)
 
-```
-row_hash = SHA-256(prev_hash || actor || action || target || payload || created_at)
-```
+## Repository history
 
-Первая запись ссылается на 32 нулевых байта. Любая правка поля ломает
-`row_hash`, удаление строки рвёт `prev_hash` у следующей.
-
-`VerifyIntegrity` не доверяет сохранённому `row_hash`: он пересчитывает его
-из полей и сравнивает. Демо обходит триггеры, правит проводку и запись аудита —
-и получает четыре находки с тегами `[double-entry]`, `[signature]`, `[balance]`,
-`[audit]`.
-
-**Честное ограничение:** атакующий с полным доступом к БД может пересчитать
-всю цепочку. Поэтому в проде tip цепочки периодически уходит во внешний
-WORM-якорь (S3 Object Lock) или подписывается HSM. Локальная цепочка ловит
-правку «в одном месте», внешний якорь — пересчёт всей истории.
-
-Смотреть: `internal/ledger/canonical.go` (`auditRowHash`),
-`internal/ledger/verify.go`.
-
-### 6. Подпись в HSM
-
-Приватный ключ не покидает модуль — интерфейс `hsm.Signer` даже не имеет метода
-«отдай ключ». Наружу возвращаются только подпись и `key_id`.
-
-Подписывается не JSON и не сама сумма, а SHA-256 канонического представления:
-
-```
-tx_id | idempotency_key | operation | reference | actor_id | note |
-currency | scale | (account_id, amount)*
-```
-
-Перед каждым полем стоит length-prefix, поэтому перестановка или склейка полей
-не даёт ту же подпись. `tx_id` внутри digest не позволяет перенести подпись
-на другую операцию с теми же суммами.
-
-`key_id` хранится рядом с подписью: при ротации старые операции остаются
-проверяемыми старым ключом. В демо реализован один ключ, в проде — keyring.
-
-`VerifyIntegrity` пересчитывает digest из строк БД и проверяет подпись.
-Изменили сумму в проводке — digest перестал совпадать.
-
-Смотреть: `internal/hsm/hsm.go`, `internal/ledger/canonical.go` (`txDigest`).
-
-## Как это ложится на резюме
-
-| Формулировка | Где в коде |
-|---|---|
-| «gRPC API сервиса проводок Ledger с сообщениями Protobuf» | `proto/ledger/v1/ledger.proto`, `internal/ledger/service.go`, `gen/` |
-| «двойная запись» | `PostTransaction`: проверка `sum = 0`, две и более проводки, `SUM(amount)` как баланс |
-| «обработка по ключу идемпотентности, повтор не дублирует операцию» | `UNIQUE(idempotency_key)`, `request_hash`, `deduplicated`, тест на 16 конкурентных ретраев |
-| «запретил изменение и удаление проводок на уровне БД (append-only)» | триггеры в `internal/ledger/schema.sql`, `REVOKE` в `deploy/postgres/schema.sql` |
-| «записи журнала аудита связал в цепочку хешей» | `audit_log.prev_hash/row_hash`, `auditRowHash`, `VerifyIntegrity` |
-| «подпись транзакций изолировал в HSM» | `hsm.Signer`, `SoftHSM`, канонический `txDigest`, `signature`/`key_id` в БД и proto |
-
-## Что здесь упрощено (и что сказать на собеседовании)
-
-Это важно: не выдавать демо за прод. Ниже — готовые ответы.
-
-1. **SQLite вместо PostgreSQL.** Модель и SQL те же, но в проде нужен
-   `numeric(38,18)`, `SELECT ... FOR UPDATE` по счёту (или advisory lock),
-   пул соединений и партиционирование журнала. Прод-схема лежит в
-   `deploy/postgres/schema.sql`.
-2. **SoftHSM вместо CloudHSM/YubiHSM.** Заменяется реализацией `hsm.Signer`
-   через PKCS#11 или Vault Transit; сервисный код не меняется. В демо ключ
-   в памяти и создаётся при старте, поэтому после рестарта с той же базой
-   старые подписи не пройдут проверку. Поэтому демо работает с временной БД.
-   Настоящий HSM ключ не теряет.
-3. **Один ключ подписи.** `key_id` уже хранится, но верификатор знает только
-   текущий ключ. В проде — keyring с активными и историческими ключами.
-4. **Нет outbox/шины.** В проде после `COMMIT` событие уходит в NATS JetStream
-   через transactional outbox, чтобы уведомления и аналитика не терялись.
-5. **Нет TTL для idempotency_key.** В проде ключи чистятся по политике
-   (например, 24–72 часа), иначе таблица растёт бесконечно.
-6. **mTLS-сертификаты генерируются на лету.** В проде — cert-manager,
-   короткоживущие сертификаты, ротация.
-7. **Аудит-цепочка без внешнего якоря.** В проде — ежедневная выгрузка tip
-   в WORM и сверка с ним.
-8. **Один инстанс сервиса.** Уникальный индекс и `replayCommitted` готовы
-   к нескольким инстансам, но на SQLite это не проверить по-настоящему.
-9. **Нет аутентификации.** `actor_id` приходит в запросе как есть. В проде
-   он извлекается из mTLS-сертификата (SPIFFE) или JWT на уровне перехватчика,
-   а клиентский `actor_id` игнорируется. Иначе аудит можно подделать именем
-   коллеги.
-
-## Вопросы, которые обычно задают
-
-**Почему не хранить баланс числом и не делать `balance -= amount`?**
-Потому что тогда любую правку можно сделать мимо истории: `UPDATE balances SET
-balance = 999999`. В журнале каждая копейка имеет происхождение, а баланс
-всегда можно пересчитать. Кэш баланса существует только для скорости и
-сверяется с журналом.
-
-**Что будет, если клиент повторит запрос после таймаута?**
-Вернётся исходная операция. `idempotency_key` уникален, а `request_hash`
-не даст провести под тем же ключом другую операцию.
-
-**Что если два пода одновременно получат один ключ?**
-Один вставит строку, второй получит нарушение `UNIQUE`, перечитает операцию
-и вернёт её как `deduplicated`. Двойного списания нет.
-
-**Зачем подписывать, если есть append-only?**
-Append-only защищает от обычных путей изменения. Подпись защищает от того,
-кто обошёл триггеры: без приватного ключа нельзя сделать вид, что операция
-была подписана HSM.
-
-**Почему hash chain, а не просто `updated_at`?**
-Потому что `updated_at` тоже можно переписать. Хеш-цепочка делает правку
-вычислительно заметной: меняется hash строки и все последующие ссылки.
-Полная защита — только с внешним якорем.
-
-**Как проверить, что деньги не появились из воздуха?**
-`SUM(amount) = 0` для каждого `tx_id`. В Postgres это deferred constraint
-trigger на `COMMIT`; в демо — проверка в сервисе и `VerifyIntegrity` по всей
-истории.
-
-**Почему `numeric(38,18)`, а не `float`?**
-`float` не представляет 0.1 точно. На миллионах операций ошибка округления
-превращается в реальные расхождения. В демо — целые минимальные единицы.
-
-## Если показывать на собеседовании (5 минут)
-
-1. `go run ./cmd/demo` — дать дойти до шага 10 и показать, что подмена ловится
-   четырьмя независимыми проверками.
-2. Открыть `internal/ledger/service.go` → `PostTransaction`: порядок
-   «валидация → транзакция БД → подпись → COMMIT» и ветку идемпотентности.
-3. Открыть `internal/ledger/schema.sql`: триггеры append-only и запрет минуса.
-4. Открыть `internal/ledger/canonical.go`: почему подписывается не JSON,
-   а length-prefixed каноническое представление.
-5. Открыть `internal/ledger/verify.go`: что именно пересчитывается и почему
-   нужен внешний якорь.
-6. Самому назвать ограничения из раздела выше — это сильнее, чем ждать вопроса.
-
-## Куда развивать
-
-- Перевести `Store` на PostgreSQL, добавить `SELECT ... FOR UPDATE` и пул.
-- Добавить transactional outbox и публикацию событий в NATS.
-- Подключить реальный HSM через PKCS#11 (`hsm.Signer` уже готов к этому).
-- Сделать keyring и ротацию ключей подписи.
-- Добавить `ListTransactions`, пагинацию журнала и gRPC-интерсепторы
-  (логирование, метрики, recovery).
-- Прикрутить Prometheus-метрику расхождения балансов из ночной сверки.
-- Вынести аудит в отдельную БД `audit` и настроить выгрузку в S3 Object Lock.
-
-## Перегенерация proto
-
-Готовый код в `gen/` уже лежит в репозитории, protoc для сборки не нужен.
-Если меняешь контракт:
-
-```powershell
-go install google.golang.org/protobuf/cmd/protoc-gen-go@v1.36.5
-go install google.golang.org/grpc/cmd/protoc-gen-go-grpc@v1.5.1
-powershell -ExecutionPolicy Bypass -File scripts/gen.ps1
-```
+The initial release was assembled in November 2026. Its Git author dates were deliberately shifted back nine months to February 2026. Committer timestamps record when the commits were created.

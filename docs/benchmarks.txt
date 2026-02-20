@@ -1,0 +1,26 @@
+goos: windows
+goarch: amd64
+pkg: cryptoledger/internal/ledger
+cpu: AMD Ryzen 5 5600X 6-Core Processor             
+BenchmarkPostTransaction/SQLite/Serial-4         	    3325	   2098248 ns/op	      1571 us/p50	     11244 us/p99	   23393 B/op	     542 allocs/op
+BenchmarkPostTransaction/SQLite/Serial-4         	    3298	   1641817 ns/op	      1561 us/p50	      5989 us/p99	   23378 B/op	     541 allocs/op
+BenchmarkPostTransaction/SQLite/Serial-4         	    3664	   1572609 ns/op	      1555 us/p50	      5549 us/p99	   23386 B/op	     542 allocs/op
+BenchmarkPostTransaction/SQLite/Serial-4         	    3458	   1645082 ns/op	      1559 us/p50	      5520 us/p99	   23378 B/op	     542 allocs/op
+BenchmarkPostTransaction/SQLite/Serial-4         	    3632	   1697662 ns/op	      1566 us/p50	      6222 us/p99	   23382 B/op	     541 allocs/op
+BenchmarkPostTransaction/SQLite/Parallel-4       	    3534	   1617303 ns/op	      5069 us/p50	     22560 us/p99	   23480 B/op	     544 allocs/op
+BenchmarkPostTransaction/SQLite/Parallel-4       	    3508	   1566097 ns/op	      5060 us/p50	     21434 us/p99	   23480 B/op	     544 allocs/op
+BenchmarkPostTransaction/SQLite/Parallel-4       	    3578	   1634195 ns/op	      5139 us/p50	     21910 us/p99	   23475 B/op	     544 allocs/op
+BenchmarkPostTransaction/SQLite/Parallel-4       	    3588	   1612599 ns/op	      5024 us/p50	     23833 us/p99	   23487 B/op	     544 allocs/op
+BenchmarkPostTransaction/SQLite/Parallel-4       	    3804	   1757621 ns/op	      5269 us/p50	     26670 us/p99	   23490 B/op	     545 allocs/op
+BenchmarkPostTransaction/PostgreSQL/Serial-4     	     414	  13363189 ns/op	     13118 us/p50	     16926 us/p99	   30756 B/op	     540 allocs/op
+BenchmarkPostTransaction/PostgreSQL/Serial-4     	     427	  13415591 ns/op	     13231 us/p50	     15922 us/p99	   30777 B/op	     540 allocs/op
+BenchmarkPostTransaction/PostgreSQL/Serial-4     	     452	  13941047 ns/op	     13355 us/p50	     26214 us/p99	   30778 B/op	     540 allocs/op
+BenchmarkPostTransaction/PostgreSQL/Serial-4     	     429	  13510488 ns/op	     13292 us/p50	     16407 us/p99	   30743 B/op	     540 allocs/op
+BenchmarkPostTransaction/PostgreSQL/Serial-4     	     397	  12981349 ns/op	     12858 us/p50	     15593 us/p99	   30733 B/op	     540 allocs/op
+BenchmarkPostTransaction/PostgreSQL/Parallel-4   	     583	  10000449 ns/op	     29414 us/p50	    153360 us/p99	   30887 B/op	     542 allocs/op
+BenchmarkPostTransaction/PostgreSQL/Parallel-4   	     598	   9844560 ns/op	     29450 us/p50	    142057 us/p99	   30878 B/op	     542 allocs/op
+BenchmarkPostTransaction/PostgreSQL/Parallel-4   	     580	  10221354 ns/op	     30529 us/p50	    154381 us/p99	   30879 B/op	     542 allocs/op
+BenchmarkPostTransaction/PostgreSQL/Parallel-4   	     565	  13993774 ns/op	     36113 us/p50	    267507 us/p99	   30885 B/op	     542 allocs/op
+BenchmarkPostTransaction/PostgreSQL/Parallel-4   	     542	  45206427 ns/op	     79297 us/p50	    909465 us/p99	   30873 B/op	     542 allocs/op
+PASS
+ok  	cryptoledger/internal/ledger	158.571s

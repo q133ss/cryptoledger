@@ -1,0 +1,7 @@
+{"version": 2, "width": 96, "height": 10, "title": "A lost reply over mTLS"}
+[0.1, "o", "$ docker compose exec ledger ledgerctl demo\r\n"]
+[0.9, "o", "1. Sent a transfer of 1.000000 USDT and discarded the reply.\r\n"]
+[1.7000000000000002, "o", "2. Retried the same key. tx_id=tx_b5a919001dc7557727d53f0b1b338647 deduplicated=true\r\n"]
+[2.5000000000000004, "o", "   acc_house_hot  -1.000000 USDT\r\n"]
+[3.3000000000000003, "o", "   acc_player_1_main  1.000000 USDT\r\n"]
+[4.1, "o", "3. Verified journal. transactions=1 entries=2 audit=1 ok=true\r\n"]
