@@ -96,7 +96,7 @@ func run() error {
 	if err != nil {
 		return fmt.Errorf("listen: %w", err)
 	}
-	grpcServer := grpc.NewServer(grpc.Creds(credentials.NewTLS(serverTLS)))
+	grpcServer := grpc.NewServer(grpc.Creds(credentials.NewTLS(serverTLS)), grpc.UnaryInterceptor(mtls.Identity))
 	ledgerv1.RegisterLedgerServiceServer(grpcServer, svc)
 	go func() { _ = grpcServer.Serve(lis) }()
 	defer grpcServer.Stop()

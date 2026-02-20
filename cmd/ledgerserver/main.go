@@ -2,9 +2,12 @@ package main
 
 import (
 	"context"
+	"errors"
 	"flag"
+	"golang.org/x/time/rate"
 	"log/slog"
 	"net"
+	"net/http"
 	"os"
 	"os/signal"
 	"syscall"
@@ -27,20 +30,29 @@ import (
 func main() {
 	addr := flag.String("addr", "127.0.0.1:50051", "адрес gRPC-сервера")
 	dbPath := flag.String("db", "ledger.db", "путь к базе журнала")
-	mtlsDir := flag.String("mtls-dir", "", "каталог с сертификатами; если задан — включить mTLS")
+	mtlsDir := flag.String("mtls-dir", ".ledger/certs", "каталог с сертификатами; если задан — включить mTLS")
 	seed := flag.Bool("seed", false, "создать демонстрационные счета при старте")
+	keyPath := flag.String("signing-key", ".ledger/signing.key", "path to local Ed25519 signing seed")
+	plain := flag.Bool("dev-plaintext", false, "allow local plaintext and caller-supplied actors")
+	health := flag.String("http-addr", "127.0.0.1:8081", "health and metrics listener")
 	flag.Parse()
 
 	log := slog.New(slog.NewTextHandler(os.Stdout, &slog.HandlerOptions{Level: slog.LevelInfo}))
 
-	store, err := ledger.Open(*dbPath)
+	var store *ledger.Store
+	var err error
+	if dsn := os.Getenv("LEDGER_DSN"); dsn != "" {
+		store, err = ledger.OpenPostgres(context.Background(), dsn)
+	} else {
+		store, err = ledger.Open(*dbPath)
+	}
 	if err != nil {
 		log.Error("open store", "err", err)
 		os.Exit(1)
 	}
 	defer store.Close()
 
-	signer, err := hsm.NewSoftHSM("soft-hsm:v1", nil)
+	signer, err := hsm.OpenLocalSigner(*keyPath)
 	if err != nil {
 		log.Error("init hsm", "err", err)
 		os.Exit(1)
@@ -62,7 +74,13 @@ func main() {
 	}
 
 	var opts []grpc.ServerOption
-	if *mtlsDir != "" {
+	var interceptors []grpc.UnaryServerInterceptor
+	if !*plain {
+		if *mtlsDir == "" {
+			log.Error("missing certificate directory")
+			os.Exit(1)
+		}
+		interceptors = append(interceptors, mtls.Identity)
 		files, err := mtls.EnsureDevCerts(*mtlsDir)
 		if err != nil {
 			log.Error("init mtls", "err", err)
@@ -77,6 +95,9 @@ func main() {
 		log.Info("mTLS enabled", "ca", files.CAPEM, "client_cert", files.ClientCert)
 	}
 
+	m := new(metrics)
+	interceptors = append(interceptors, m.interceptor(log, rate.NewLimiter(1000, 2000)))
+	opts = append(opts, grpc.ChainUnaryInterceptor(interceptors...))
 	lis, err := net.Listen("tcp", *addr)
 	if err != nil {
 		log.Error("listen", "err", err)
@@ -91,6 +112,19 @@ func main() {
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
 
+	httpLis, err := net.Listen("tcp", *health)
+	if err != nil {
+		log.Error("health listener", "err", err)
+		os.Exit(1)
+	}
+	healthServer := &http.Server{Handler: m.routes(store), ReadHeaderTimeout: 3 * time.Second}
+	go func() {
+		if err := healthServer.Serve(httpLis); err != nil && !errors.Is(err, http.ErrServerClosed) {
+			log.Error("health server", "err", err)
+			stop()
+		}
+	}()
+	defer healthServer.Close()
 	go func() {
 		<-ctx.Done()
 		stopped := make(chan struct{})
