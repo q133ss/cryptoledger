@@ -1,0 +1,12 @@
+# Local databases, credentials and build output
+*.exe
+*.db
+*.db-wal
+*.db-shm
+.certs/
+.ledger/
+*.key
+.env
+coverage.out
+bin/
+dist/

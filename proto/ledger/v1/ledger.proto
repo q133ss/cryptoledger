@@ -1,0 +1,156 @@
+syntax = "proto3";
+
+package ledger.v1;
+
+import "google/protobuf/timestamp.proto";
+
+option go_package = "cryptoledger/gen/ledger/v1;ledgerv1";
+
+// LedgerService — единственный сервис, который имеет право менять деньги.
+// Снаружи к нему ходят по gRPC (в проде — mTLS), и каждый вызов несёт
+// idempotency_key. Повторный вызов с тем же ключом не проводит операцию второй раз.
+service LedgerService {
+  // Провести операцию двойной записи.
+  rpc PostTransaction(PostTransactionRequest) returns (PostTransactionResponse);
+
+  // Прочитать счёт и его баланс.
+  rpc GetAccount(GetAccountRequest) returns (GetAccountResponse);
+
+  // История проводок (append-only журнал).
+  rpc ListEntries(ListEntriesRequest) returns (ListEntriesResponse);
+
+  // Проверить целостность: сумму проводок, кэш балансов, подписи HSM и хеш-цепочку аудита.
+  rpc VerifyIntegrity(VerifyIntegrityRequest) returns (VerifyIntegrityResponse);
+}
+
+// Тип счёта. От него зависит, можно ли уводить баланс в минус:
+// счета игрока — никогда, счета компании (equity) — могут быть отрицательными.
+enum AccountKind {
+  ACCOUNT_KIND_UNSPECIFIED = 0;
+  ACCOUNT_KIND_PLAYER_MAIN = 1;   // основной кошелёк игрока
+  ACCOUNT_KIND_PLAYER_LOCKED = 2; // резерв под вывод
+  ACCOUNT_KIND_PLAYER_BONUS = 3;  // бонусный баланс
+  ACCOUNT_KIND_HOUSE_HOT = 4;     // горячий кошелёк компании
+  ACCOUNT_KIND_HOUSE_EQUITY = 5;  // собственный капитал компании
+  ACCOUNT_KIND_FEE = 6;           // комиссии / rake
+}
+
+// Бизнес-смысл операции. В журнал попадает строкой, чтобы дамп БД читался человеком.
+enum Operation {
+  OPERATION_UNSPECIFIED = 0;
+  OPERATION_DEPOSIT = 1;
+  OPERATION_WITHDRAW = 2;
+  OPERATION_BET = 3;
+  OPERATION_WIN = 4;
+  OPERATION_ROLLBACK = 5;
+  OPERATION_HOLD = 6;   // резерв средств под заявку на вывод
+  OPERATION_ADJUST = 7; // ручная корректировка (в проде — maker–checker)
+}
+
+// Одна сторона проводки. Сумма знаковая и означает ИЗМЕНЕНИЕ БАЛАНСА счёта:
+// плюс — зачисление, минус — списание. Баланс счёта = сумма всех его проводок.
+//
+// Такой знак удобнее классического «дебет/кредит»: одно правило для всех счетов,
+// не нужно помнить, у какого типа счёта дебет увеличивает баланс.
+message Posting {
+  string account_id = 1;
+
+  // Сумма в минимальных единицах валюты счёта.
+  // Пример: scale=6, 1 USDT = 1_000_000; сумма 250 USDT = 250_000_000.
+  // Целые числа вместо float: 0.1 + 0.2 не превращается в 0.30000000000000004.
+  sint64 amount = 2;
+}
+
+message PostTransactionRequest {
+  // Ключ идемпотентности. Уникален в базе.
+  // Повтор с тем же ключом и тем же телом возвращает исходную операцию.
+  string idempotency_key = 1;
+
+  // Бизнес-ссылка: "game_round:<id>", "payout:<id>", "deposit:<txhash>".
+  // По ней финансы и саппорт находят, из-за чего появились деньги.
+  string reference = 2;
+
+  Operation operation = 3;
+
+  // Минимум две стороны, сумма всех amount обязана быть 0.
+  // Например, депозит 250 USDT: house_hot -250 / player_main +250.
+  // Деньги переехали из кассы в обязательство, но не появились.
+  repeated Posting postings = 4;
+
+  // Кто инициировал: id сервиса или сотрудника. Попадает в аудит.
+  string actor_id = 5;
+
+  // Свободный комментарий, часть подписываемого контракта.
+  string note = 6;
+}
+
+// Подпись операции. В проде её ставит HSM: приватный ключ не покидает модуль,
+// наружу возвращается только подпись. Здесь — интерфейс hsm.Signer.
+message Signature {
+  string algorithm = 1; // "ed25519"
+  string key_id = 2;    // версия ключа: нужна для ротации
+  bytes value = 3;      // сама подпись
+  bytes digest = 4;     // SHA-256 канонического представления операции
+}
+
+message AccountBalance {
+  string account_id = 1;
+  string owner_id = 2;
+  AccountKind kind = 3;
+  string currency = 4;
+  sint64 balance = 5; // в минимальных единицах
+  int32 scale = 6;    // сколько знаков после запятой
+}
+
+message PostTransactionResponse {
+  string tx_id = 1;
+
+  // true — это повтор уже проведённой операции. Деньги не двигались.
+  bool deduplicated = 2;
+
+  google.protobuf.Timestamp committed_at = 3;
+  Signature signature = 4;
+
+  // Состояние затронутых счетов после операции.
+  repeated AccountBalance balances = 5;
+}
+
+message GetAccountRequest {
+  string account_id = 1;
+}
+
+message GetAccountResponse {
+  AccountBalance account = 1;
+}
+
+message LedgerEntry {
+  int64 seq = 1; // монотонный номер в append-only журнале
+  string tx_id = 2;
+  string account_id = 3;
+  sint64 amount = 4;
+  Operation operation = 5;
+  string reference = 6;
+  string idempotency_key = 7;
+  google.protobuf.Timestamp created_at = 8;
+}
+
+message ListEntriesRequest {
+  // Пустая строка — все счета.
+  string account_id = 1;
+  int32 limit = 2;
+}
+
+message ListEntriesResponse {
+  repeated LedgerEntry entries = 1;
+}
+
+message VerifyIntegrityRequest {}
+
+message VerifyIntegrityResponse {
+  bool ok = 1;
+  int64 entries_checked = 2;
+  int64 transactions_checked = 3;
+  int64 audit_records_checked = 4;
+  // Человекочитаемые находки. Пусто, если ok=true.
+  repeated string problems = 5;
+}
