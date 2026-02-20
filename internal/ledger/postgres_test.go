@@ -128,6 +128,29 @@ func TestPostgresLostReply(t *testing.T) {
 	if _, err = db.ExecContext(ctx, "DELETE FROM transactions WHERE tx_id=$1", id); err == nil {
 		t.Fatal("runtime role can delete history")
 	}
+	// Distinct keys compete to debit the full remaining balance.
+	// Exactly one debit can commit after the row lock is acquired.
+	debitResults := make(chan error, len(services))
+	for i, s := range services {
+		debit := proto.Clone(req).(*v1.PostTransactionRequest)
+		debit.IdempotencyKey = fmt.Sprintf("%s-withdraw-%d", key, i)
+		debit.Operation = v1.Operation_OPERATION_WITHDRAW
+		debit.Postings[0].Amount = 300
+		debit.Postings[1].Amount = -300
+		go func() { _, err := s.PostTransaction(ctx, debit); debitResults <- err }()
+	}
+	successes := 0
+	for range services {
+		err := <-debitResults
+		if err == nil {
+			successes++
+		} else {
+			wantCode(t, err, codes.FailedPrecondition)
+		}
+	}
+	if successes != 1 {
+		t.Fatalf("%d debits succeeded", successes)
+	}
 	report, err := svc.VerifyIntegrity(ctx, &v1.VerifyIntegrityRequest{})
 	if err != nil {
 		t.Fatal(err)
