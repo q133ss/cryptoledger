@@ -1,0 +1,10 @@
+.git
+.ledger
+.certs
+.env
+*.db*
+*.key
+*.exe
+bin
+dist
+docs
