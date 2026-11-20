@@ -57,7 +57,3 @@ This reference implementation covers the Ledger component of the [platform diagr
 The gRPC interface exposes posting, account lookup, entry history and verification. `ledgerctl account create` and `audit tail` are local operator commands using database access. In Compose the HTTP listener is bound to localhost on port 8081 and serves `/healthz`, `/readyz` and `/metrics`. The gRPC listener is bound to localhost on port 50051. Set LEDGER_PORT and LEDGER_HTTP_PORT to change the host ports.
 
 [Measured throughput and latency](docs/benchmarks.md) · [API contract](proto/ledger/v1/ledger.proto) · [Contributing and integration tests](CONTRIBUTING.md) · [Open work](https://github.com/q133ss/cryptoledger/issues)
-
-## Repository history
-
-The initial release was assembled in November 2026. Its Git author dates were deliberately shifted back nine months to February 2026. Committer timestamps record when the commits were created.
